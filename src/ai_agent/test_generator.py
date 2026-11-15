@@ -997,36 +997,70 @@ Return only JSON matching the supplied schema.
         print("\nConnecting to Groq AI...")
         print(f"Model: {self.model}")
 
-        response = self.client.chat.completions.create(
-
-            model=self.model,
-
-            messages=[
-                {
-                    "role": "system",
-                    "content": self._build_instructions()
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": self._build_instructions()
+                    },
+                    {
+                        "role": "user",
+                        "content": self._build_prompt(user_prompt)
+                    }
+                ],
+                response_format={
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "test_suite",
+                        "strict": True,
+                        "schema": self._get_json_schema()
+                    }
                 },
-                {
-                    "role": "user",
-                    "content": self._build_prompt(user_prompt)
-                }
-            ],
+                reasoning_effort="low",
+                max_completion_tokens=8192
+            )
 
-            response_format={
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "test_suite",
-                    "strict": True,
-                    "schema": self._get_json_schema()
-                }
-            },
+        except Exception as error:
 
-            reasoning_effort="low",
-            max_completion_tokens=8192
-        )
+            print("\n========== GROQ API ERROR ==========")
+            print("Error type:", type(error).__name__)
+            print("Error message:", str(error))
+
+            error_body = getattr(error, "body", None)
+
+            print("\nComplete API error body:")
+            print(json.dumps(
+                error_body,
+                indent=4,
+                default=str
+            ))
+
+            if isinstance(error_body, dict):
+
+                error_details = error_body.get(
+                    "error",
+                    error_body
+                )
+
+                if isinstance(error_details, dict):
+
+                    failed_generation = error_details.get(
+                        "failed_generation"
+                    )
+
+                    if failed_generation:
+                        print("\nFAILED GENERATION DETAILS:")
+                        print(failed_generation)
+
+            print("\n====================================")
+
+            raise RuntimeError(
+                f"Groq API request failed: {error}"
+            ) from error
 
         if not response.choices:
-
             raise RuntimeError(
                 "Groq returned no response choices."
             )
@@ -1034,13 +1068,11 @@ Return only JSON matching the supplied schema.
         choice = response.choices[0]
 
         if choice.finish_reason == "length":
-
             raise RuntimeError(
                 "Groq response reached its token limit."
             )
 
         if choice.message.refusal:
-
             raise RuntimeError(
                 f"Groq refused the request: "
                 f"{choice.message.refusal}"
@@ -1049,14 +1081,12 @@ Return only JSON matching the supplied schema.
         content = choice.message.content
 
         if not content:
-
             raise RuntimeError(
                 "Groq returned an empty response."
             )
 
         result = TestSuite.model_validate_json(content)
 
-        # Diagnostic output.
         print("\n========== GENERATED TEST STEPS ==========")
 
         for test_case in result.test_cases:
@@ -1069,7 +1099,6 @@ Return only JSON matching the supplied schema.
                 test_case.steps,
                 start=1
             ):
-
                 print(
                     f"{index}. ACTION={step.action} | "
                     f"TARGET={step.target} | "
@@ -1079,7 +1108,6 @@ Return only JSON matching the supplied schema.
 
         print("\n==========================================")
 
-        # This validation runs BEFORE Playwright execution.
         self._validate_scenario_coverage(
             user_prompt,
             result.test_cases

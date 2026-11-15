@@ -1,0 +1,27 @@
+.streamlit/secrets.toml
+.env
+.venv/
+__pycache__/
+
+# Python generated files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+
+# Secrets and environment variables
+.env
+.env.*
+!.env.example
+.streamlit/secrets.toml
+
+# Generated test reports and execution artifacts
+reports/
+
+# IDE and operating system files
+.vscode/
+.DS_Store
+Thumbs.db
