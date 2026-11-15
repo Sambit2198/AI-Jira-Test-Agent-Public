@@ -1,31 +1,38 @@
 
-import pyautogui
+import os
+import sys
 
 
 class MouseController:
-
     def __init__(self, page):
-
         self.page = page
 
     def click(self, locator):
+        # Use Playwright clicks on Linux cloud servers.
+        # Preserve physical mouse clicks on Windows locally.
+        use_physical_mouse = (
+            sys.platform == "win32"
+            and os.getenv("PLAYWRIGHT_USE_PHYSICAL_MOUSE", "true").lower()
+            == "true"
+        )
 
-        # Make sure the element is visible
+        if not use_physical_mouse:
+            locator.click()
+            return
+
+        import pyautogui
+
         locator.scroll_into_view_if_needed()
-
         self.page.wait_for_timeout(500)
 
-        # Get element position inside browser
         box = locator.bounding_box()
 
         if box is None:
             raise Exception("Element is not visible on screen.")
 
-        # Calculate element centre
         x = box["x"] + box["width"] / 2
         y = box["y"] + box["height"] / 2
 
-        # Get browser window screen information
         browser = self.page.evaluate("""() => ({
             screenX: window.screenX,
             screenY: window.screenY,
@@ -36,7 +43,6 @@ class MouseController:
             dpr: window.devicePixelRatio
         })""")
 
-        # Calculate browser frame dimensions
         border = (
             browser["outerWidth"] - browser["innerWidth"]
         ) / 2
@@ -47,7 +53,6 @@ class MouseController:
             - border
         )
 
-        # Convert browser coordinates to Windows coordinates
         screen_x = (
             browser["screenX"] + border + x
         ) * browser["dpr"]
@@ -56,16 +61,7 @@ class MouseController:
             browser["screenY"] + top_bar + y
         ) * browser["dpr"]
 
-        # Move actual Windows cursor
-        pyautogui.moveTo(
-            screen_x,
-            screen_y,
-            duration=1
-        )
-
+        pyautogui.moveTo(screen_x, screen_y, duration=1)
         pyautogui.sleep(0.5)
-
-        # Physically click
         pyautogui.click()
-
         pyautogui.sleep(0.5)

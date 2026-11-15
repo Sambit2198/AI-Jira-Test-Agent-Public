@@ -1,8 +1,10 @@
 
 import os
+import sys
 import json
 import queue
 import threading
+import subprocess
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -17,19 +19,88 @@ from src.reporting.result_adapter import adapt_ai_report
 from src.reporting.word_reporter import WordReporter
 from src.reporting.excel_reporter import ExcelReporter
 
+
 load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPORT_FOLDER = PROJECT_ROOT / "reports"
-REPORT_FOLDER.mkdir(exist_ok=True)
+REPORT_FOLDER.mkdir(parents=True, exist_ok=True)
+
+IS_CLOUD = sys.platform.startswith("linux")
+
+# Preserve the original local Windows execution settings.
+BROWSER_HEADLESS = IS_CLOUD
+BROWSER_SLOW_MO = 0 if IS_CLOUD else 1000
+BROWSER_HOLD_SECONDS = 0 if IS_CLOUD else 10000
+
+
+def load_streamlit_secrets():
+    """Make Streamlit Cloud secrets available to existing modules."""
+    for key in (
+        "GROQ_API_KEY",
+        "SAUCEDEMO_USERNAME",
+        "SAUCEDEMO_PASSWORD"
+    ):
+        if os.getenv(key):
+            continue
+
+        try:
+            value = st.secrets.get(key)
+            if value:
+                os.environ[key] = str(value)
+        except Exception:
+            # Local execution can continue using .env or defaults.
+            pass
+
+
+load_streamlit_secrets()
+
+
+def ensure_chromium_installed(playwright):
+    """Install the matching Chromium browser if it is not available."""
+    executable = Path(playwright.chromium.executable_path)
+
+    if executable.exists():
+        return
+
+    st_message = (
+        "Chromium is not installed. Installing the Playwright browser..."
+    )
+
+    print(st_message)
+
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "playwright",
+            "install",
+            "chromium"
+        ],
+        check=True
+    )
+
+    if not executable.exists():
+        raise RuntimeError(
+            "Chromium installation completed, but its executable "
+            "could not be found."
+        )
 
 
 def resolve_test_data(test_case):
     credentials = {
-        "<valid_username>": os.getenv("SAUCEDEMO_USERNAME", "standard_user"),
-        "<valid_password>": os.getenv("SAUCEDEMO_PASSWORD", "secret_sauce"),
-        "<VALID_USERNAME>": os.getenv("SAUCEDEMO_USERNAME", "standard_user"),
-        "<VALID_PASSWORD>": os.getenv("SAUCEDEMO_PASSWORD", "secret_sauce"),
+        "<valid_username>": os.getenv(
+            "SAUCEDEMO_USERNAME", "standard_user"
+        ),
+        "<valid_password>": os.getenv(
+            "SAUCEDEMO_PASSWORD", "secret_sauce"
+        ),
+        "<VALID_USERNAME>": os.getenv(
+            "SAUCEDEMO_USERNAME", "standard_user"
+        ),
+        "<VALID_PASSWORD>": os.getenv(
+            "SAUCEDEMO_PASSWORD", "secret_sauce"
+        ),
         "<invalid_username>": "invalid_user",
         "<invalid_password>": "invalid_password",
         "<INVALID_USERNAME>": "invalid_user",
@@ -56,7 +127,10 @@ def prepare_test_case(test_case, website_url):
     steps = test_case.get("steps", [])
 
     navigation_step = next(
-        (step for step in steps if step.get("action") == "navigate"),
+        (
+            step for step in steps
+            if step.get("action") == "navigate"
+        ),
         None
     )
 
@@ -75,32 +149,47 @@ def prepare_test_case(test_case, website_url):
     return test_case
 
 
-def _execute_test_suite_in_worker(test_cases, website_url, message_queue):
-    """
-    All Playwright operations happen inside this worker thread.
-    The browser, contexts, pages and Playwright session are created,
-    used and closed in this same thread.
-    """
+def _execute_test_suite_in_worker(
+    test_cases,
+    website_url,
+    message_queue
+):
+    """Run all Playwright operations inside one dedicated worker thread."""
     from playwright.sync_api import sync_playwright
 
     execution_results = []
     suite_start = datetime.now()
     counter_start = perf_counter()
 
-    message_queue.put("Starting Playwright in the dedicated browser thread...")
+    message_queue.put(
+        "Starting Playwright in the dedicated browser thread..."
+    )
 
     with sync_playwright() as playwright:
+
+        if IS_CLOUD:
+            message_queue.put("Checking cloud Chromium installation...")
+            ensure_chromium_installed(playwright)
+
         browser = playwright.chromium.launch(
-            headless=False,
-            slow_mo=1000,
-            args=["--start-maximized"]
+            headless=BROWSER_HEADLESS,
+            slow_mo=BROWSER_SLOW_MO,
+            args=[] if IS_CLOUD else ["--start-maximized"]
         )
 
         try:
-            message_queue.put("Chromium browser launched successfully.")
+            message_queue.put(
+                "Chromium browser launched successfully."
+            )
 
-            for index, original_case in enumerate(test_cases, start=1):
-                test_case = prepare_test_case(original_case, website_url)
+            for index, original_case in enumerate(
+                test_cases,
+                start=1
+            ):
+                test_case = prepare_test_case(
+                    original_case,
+                    website_url
+                )
 
                 test_id = test_case.get("id", "UNKNOWN")
                 title = test_case.get("title", "Untitled test")
@@ -114,7 +203,13 @@ def _execute_test_suite_in_worker(test_cases, website_url, message_queue):
                 page = None
 
                 try:
-                    context = browser.new_context(no_viewport=True)
+                    if IS_CLOUD:
+                        context = browser.new_context()
+                    else:
+                        context = browser.new_context(
+                            no_viewport=True
+                        )
+
                     page = context.new_page()
 
                     executor = PlaywrightExecutor(page)
@@ -123,22 +218,29 @@ def _execute_test_suite_in_worker(test_cases, website_url, message_queue):
                     execution_results.append(result)
 
                     message_queue.put(
-                        f"{test_id}: {result.get('status', 'UNKNOWN')}"
+                        f"{test_id}: "
+                        f"{result.get('status', 'UNKNOWN')}"
                     )
 
                 except Exception as error:
                     execution_results.append({
                         "test_case_id": test_id,
                         "title": title,
-                        "preconditions": test_case.get("preconditions", ""),
-                        "expected_result": test_case.get("expected_result", ""),
+                        "preconditions": test_case.get(
+                            "preconditions", ""
+                        ),
+                        "expected_result": test_case.get(
+                            "expected_result", ""
+                        ),
                         "status": "FAIL",
                         "start_time": "Not recorded",
                         "end_time": datetime.now().strftime(
                             "%Y-%m-%d %H:%M:%S"
                         ),
                         "duration": 0,
-                        "actual_result": f"Test execution failed: {error}",
+                        "actual_result": (
+                            f"Test execution failed: {error}"
+                        ),
                         "error": str(error),
                         "steps": []
                     })
@@ -150,8 +252,13 @@ def _execute_test_suite_in_worker(test_cases, website_url, message_queue):
                 finally:
                     if page is not None:
                         try:
-                            if not page.is_closed():
-                                page.wait_for_timeout(10000)
+                            if (
+                                not page.is_closed()
+                                and BROWSER_HOLD_SECONDS > 0
+                            ):
+                                page.wait_for_timeout(
+                                    BROWSER_HOLD_SECONDS
+                                )
                         except Exception:
                             pass
 
@@ -168,8 +275,12 @@ def _execute_test_suite_in_worker(test_cases, website_url, message_queue):
     duration = round(perf_counter() - counter_start, 2)
 
     timing = {
-        "suite_start_time": suite_start.strftime("%Y-%m-%d %H:%M:%S"),
-        "suite_end_time": suite_end.strftime("%Y-%m-%d %H:%M:%S"),
+        "suite_start_time": suite_start.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ),
+        "suite_end_time": suite_end.strftime(
+            "%Y-%m-%d %H:%M:%S"
+        ),
         "suite_duration": duration
     }
 
@@ -177,10 +288,7 @@ def _execute_test_suite_in_worker(test_cases, website_url, message_queue):
 
 
 def execute_test_suite(test_cases, website_url, progress):
-    """
-    Starts a dedicated worker thread for Playwright.
-    Streamlit UI updates remain on the main Streamlit thread.
-    """
+    """Run Playwright in its own thread while Streamlit updates progress."""
     message_queue = queue.Queue()
     worker_result = {}
 
@@ -227,14 +335,22 @@ def execute_test_suite(test_cases, website_url, progress):
             f"Browser worker failed: {worker_result['error']}"
         ) from worker_result["error"]
 
-    return worker_result["results"], worker_result["timing"]
+    return (
+        worker_result["results"],
+        worker_result["timing"]
+    )
 
 
 def generate_reports(report):
     json_path = REPORT_FOLDER / "ai_execution_report.json"
 
     with open(json_path, "w", encoding="utf-8") as file:
-        json.dump(report, file, indent=4, ensure_ascii=False)
+        json.dump(
+            report,
+            file,
+            indent=4,
+            ensure_ascii=False
+        )
 
     adapted_results = adapt_ai_report(report)
 
@@ -250,7 +366,9 @@ def generate_reports(report):
         excel_result = dict(result)
 
         excel_result["status"] = (
-            "PASSED" if result.get("status") == "PASS" else "FAILED"
+            "PASSED"
+            if result.get("status") == "PASS"
+            else "FAILED"
         )
 
         excel_result["test_case_id"] = result.get(
@@ -285,7 +403,11 @@ def generate_reports(report):
 
     excel_path = excel_reporter.generate_report()
 
-    return Path(json_path), Path(word_path), Path(excel_path)
+    return (
+        Path(json_path),
+        Path(word_path),
+        Path(excel_path)
+    )
 
 
 # ---------------------------------------------------------
@@ -390,7 +512,9 @@ if start_execution:
                 progress_status.write("Connecting to Groq AI...")
 
                 generator = AITestGenerator()
-                generated = generator.generate_test_cases(test_prompt)
+                generated = generator.generate_test_cases(
+                    test_prompt
+                )
 
                 test_cases = generated["test_cases"]
 
@@ -403,9 +527,14 @@ if start_execution:
                     f"Generated {len(test_cases)} test cases."
                 )
 
-                progress_status.write(
-                    "Starting visible Playwright browser..."
-                )
+                if IS_CLOUD:
+                    progress_status.write(
+                        "Starting headless cloud Chromium..."
+                    )
+                else:
+                    progress_status.write(
+                        "Starting visible local Chromium..."
+                    )
 
                 execution_results, timing = execute_test_suite(
                     test_cases,
@@ -431,7 +560,9 @@ if start_execution:
                     "failed": failed,
                     "suite_start_time": timing["suite_start_time"],
                     "suite_end_time": timing["suite_end_time"],
-                    "total_execution_duration": timing["suite_duration"],
+                    "total_execution_duration": timing[
+                        "suite_duration"
+                    ],
                     "execution_results": execution_results
                 }
 
@@ -439,7 +570,9 @@ if start_execution:
                     "Generating Word and Excel reports..."
                 )
 
-                json_path, word_path, excel_path = generate_reports(report)
+                json_path, word_path, excel_path = generate_reports(
+                    report
+                )
 
                 st.session_state["last_execution"] = {
                     "report": report,
